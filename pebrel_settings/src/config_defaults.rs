@@ -2,7 +2,7 @@
 
 use std::sync::OnceLock;
 
-use crate::RawSettings;
+use crate::{CredentialStoreSettings, RawSettings};
 
 static DEFAULTS: OnceLock<RawSettings> = OnceLock::new();
 
@@ -98,7 +98,10 @@ pub fn ui_value_kind(key: &str) -> Option<UiValueKind> {
         | "background_image_fit"
         | "background_image_alignment"
         | "quick_terminal_mode"
-        | "quick_terminal_hotkey" => String,
+        | "quick_terminal_hotkey"
+        | CredentialStoreSettings::BACKEND_KEY
+        | CredentialStoreSettings::CLI_PATH_KEY
+        | CredentialStoreSettings::FOLDER_KEY => String,
         _ => return None,
     })
 }

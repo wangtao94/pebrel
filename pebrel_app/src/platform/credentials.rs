@@ -1,5 +1,89 @@
 use std::borrow::Cow;
 use std::io;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+
+use pebrel_settings::{CredentialBackend, CredentialStoreSettings, RuntimeSettings};
+
+mod bitwarden;
+
+struct CredentialStore {
+    settings: CredentialStoreSettings,
+    cli: Option<PathBuf>,
+    available: bool,
+}
+
+static STORE: OnceLock<CredentialStore> = OnceLock::new();
+static BITWARDEN_WRITES: Mutex<()> = Mutex::new(());
+
+impl CredentialStore {
+    fn resolve() -> Self {
+        let settings = with_overrides(RuntimeSettings::load().credential_store, |name| {
+            std::env::var(name).ok()
+        });
+        let cli = match settings.backend {
+            CredentialBackend::System => None,
+            CredentialBackend::BitwardenBw => {
+                bitwarden::find_cli("bw", &settings.bitwarden_cli_path)
+            },
+            CredentialBackend::BitwardenRbw => {
+                bitwarden::find_cli("rbw", &settings.bitwarden_cli_path)
+            },
+        };
+        let available = match settings.backend {
+            CredentialBackend::System => system_can_store(),
+            _ => cli.is_some(),
+        };
+        Self { settings, cli, available }
+    }
+
+    fn bitwarden(&self) -> io::Result<bitwarden::Bitwarden<'_, bitwarden::CommandRunner<'_>>> {
+        let cli = self.cli.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Install the selected Bitwarden CLI or set PEBREL_BITWARDEN_CLI_PATH, then restart Pebrel",
+            )
+        })?;
+        Ok(bitwarden::Bitwarden::new(&self.settings, bitwarden::CommandRunner(cli)))
+    }
+}
+
+fn with_overrides(
+    mut settings: CredentialStoreSettings,
+    value: impl Fn(&str) -> Option<String>,
+) -> CredentialStoreSettings {
+    if let Some(backend) =
+        value("PEBREL_CREDENTIAL_BACKEND").as_deref().and_then(CredentialBackend::from_settings)
+    {
+        settings.backend = backend;
+    }
+    if let Some(path) = value("PEBREL_BITWARDEN_CLI_PATH")
+        .filter(|path| CredentialStoreSettings::valid_cli_path(path))
+    {
+        settings.bitwarden_cli_path = path;
+    }
+    if let Some(folder) = value("PEBREL_BITWARDEN_FOLDER")
+        .filter(|folder| CredentialStoreSettings::valid_folder(folder))
+    {
+        settings.bitwarden_folder = folder;
+    }
+    settings
+}
+
+fn credential_store() -> &'static CredentialStore {
+    STORE.get_or_init(CredentialStore::resolve)
+}
+
+/// Capture the backend and executable availability once, before the GUI starts.
+pub(crate) fn initialize() {
+    let _ = credential_store();
+}
+
+fn bitwarden_write<T>(write: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    let _guard =
+        BITWARDEN_WRITES.lock().map_err(|_| io::Error::other("Credential write failed"))?;
+    write()
+}
 
 struct CredentialIdentity<'a> {
     service: &'static str,
@@ -30,7 +114,14 @@ impl<'a> CredentialIdentity<'a> {
 }
 
 pub fn load(target: &str) -> io::Result<Option<Vec<u8>>> {
-    load_with(target, load_at)
+    let store = credential_store();
+    match store.settings.backend {
+        CredentialBackend::System => load_with(target, load_at),
+        _ => {
+            let cli = store.bitwarden()?;
+            load_with(target, |identity| cli.load(&identity.target))
+        },
+    }
 }
 
 fn load_with(
@@ -51,11 +142,26 @@ pub fn store(target: &str, secret: &[u8]) -> io::Result<()> {
 }
 
 pub fn store_with_username(target: &str, username: &str, secret: &[u8]) -> io::Result<()> {
-    store_at(&CredentialIdentity::current(target), username, secret)
+    let store = credential_store();
+    let identity = CredentialIdentity::current(target);
+    match store.settings.backend {
+        CredentialBackend::System => store_at(&identity, username, secret),
+        _ => {
+            let cli = store.bitwarden()?;
+            bitwarden_write(|| cli.store(&identity.target, username, secret))
+        },
+    }
 }
 
 pub fn delete(target: &str) -> io::Result<()> {
-    delete_with(target, delete_at)
+    let store = credential_store();
+    match store.settings.backend {
+        CredentialBackend::System => delete_with(target, delete_at),
+        _ => {
+            let cli = store.bitwarden()?;
+            bitwarden_write(|| delete_with(target, |identity| cli.delete(&identity.target)))
+        },
+    }
 }
 
 fn delete_with(
@@ -71,6 +177,10 @@ fn delete_with(
 }
 
 pub fn can_store() -> bool {
+    STORE.get().is_some_and(|store| store.available)
+}
+
+fn system_can_store() -> bool {
     #[cfg(any(windows, target_os = "macos"))]
     {
         true
@@ -179,7 +289,7 @@ fn invoke(
 
 #[cfg(not(any(windows, target_os = "macos")))]
 fn load_at(identity: &CredentialIdentity<'_>) -> io::Result<Option<Vec<u8>>> {
-    if !can_store() {
+    if !system_can_store() {
         return Ok(None);
     }
     let output = invoke("lookup", identity, None)?;
@@ -227,6 +337,42 @@ fn valid_secret(secret: &[u8]) -> bool {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn environment_overrides_file_settings_independently() {
+        let configured = CredentialStoreSettings {
+            backend: CredentialBackend::BitwardenBw,
+            bitwarden_cli_path: "/file/bw".into(),
+            bitwarden_folder: "From file".into(),
+        };
+        let resolved = with_overrides(configured.clone(), |name| {
+            match name {
+                "PEBREL_CREDENTIAL_BACKEND" => Some("rbw"),
+                "PEBREL_BITWARDEN_CLI_PATH" => Some("/env/rbw"),
+                "PEBREL_BITWARDEN_FOLDER" => Some(""),
+                _ => None,
+            }
+            .map(str::to_owned)
+        });
+        assert_eq!(
+            resolved,
+            CredentialStoreSettings {
+                backend: CredentialBackend::BitwardenRbw,
+                bitwarden_cli_path: "/env/rbw".into(),
+                bitwarden_folder: String::new(),
+            },
+        );
+        let resolved = with_overrides(configured.clone(), |name| {
+            match name {
+                "PEBREL_CREDENTIAL_BACKEND" => Some("unknown"),
+                "PEBREL_BITWARDEN_CLI_PATH" => Some("bad\npath"),
+                "PEBREL_BITWARDEN_FOLDER" => Some("bad\0folder"),
+                _ => None,
+            }
+            .map(str::to_owned)
+        });
+        assert_eq!(resolved, configured);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

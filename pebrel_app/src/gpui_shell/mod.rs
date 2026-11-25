@@ -110,6 +110,7 @@ pub fn run_shell(
     // Script execution belongs to startup, before any GUI or background consumer
     // reads its first RuntimeSettings snapshot.
     let startup_window = config::source::initialize(config_file.clone());
+    crate::platform::credentials::initialize();
     let (shell_tx, shell_rx) = std::sync::mpsc::channel();
     let _elevated_handover = if !instance::explicitly_requested()
         && crate::platform::elevation::is_elevated().is_ok_and(|value| value)

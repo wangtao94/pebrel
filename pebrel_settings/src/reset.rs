@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::CredentialStoreSettings;
+
 const RESET_KEYS: &[&str] = &[
     "scrollback_lines",
     "scroll_speed",
@@ -42,6 +44,9 @@ const RESET_KEYS: &[&str] = &[
     "prompt_suggestions_enabled",
     "prompt_suggestions_provider_id",
     "prompt_suggestions_model",
+    CredentialStoreSettings::BACKEND_KEY,
+    CredentialStoreSettings::CLI_PATH_KEY,
+    CredentialStoreSettings::FOLDER_KEY,
     "cjk_bold_regular",
     "tabs_position",
     "tab_reveal",
@@ -121,7 +126,7 @@ pub fn restore_default_settings() -> io::Result<Option<PathBuf>> {
     restore_defaults_at(&super::settings_path())
 }
 
-fn default_settings_text(text: &str) -> String {
+pub(super) fn default_settings_text(text: &str) -> String {
     text.split_inclusive('\n')
         .filter(|line| {
             !line.split_once('=').is_some_and(|(key, _)| {
