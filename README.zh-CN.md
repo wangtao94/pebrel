@@ -34,6 +34,9 @@
 
 ---
 
+> [!NOTE]
+> **Fork 说明（`wangtao94/pebrel`）**：本仓库是基于 [`Kuddev/pebrel`](https://github.com/Kuddev/pebrel) 的轻量化跟踪 Fork，在保持系统钥匙串为默认行为的前提下，新增**可选 Bitwarden CLI（`bw` / `rbw`）凭据存储后端**（支持自托管 Bitwarden 与 Vaultwarden），并配套上游自动同步与 Windows / Linux x64 自动 Release 构建。详细差异、配置方法与环境变量请见 **[FORK.md](FORK.md)**。
+
 <p align="center">
   <img src="docs/screenshots/nebula-top-tabs.png" alt="Pebrel 终端标签" width="1040" />
 </p>

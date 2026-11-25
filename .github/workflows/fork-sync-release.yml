@@ -1,0 +1,300 @@
+name: Fork Sync & Release (Windows/Linux x64)
+
+on:
+  schedule:
+    # Daily check for new upstream stable release tags (02:00 UTC / 10:00 CST)
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      sync_upstream:
+        description: "Sync latest upstream stable release tag before building"
+        type: boolean
+        default: true
+      publish_release:
+        description: "Build and publish Windows x64 + Linux x64 GitHub Release"
+        type: boolean
+        default: true
+      release_suffix:
+        description: "Optional tag suffix (default: bw.<run_number>)"
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: fork-sync-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: Kuddev/pebrel
+  FORK_BRANCH: fork-main
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sync-upstream:
+    name: Sync upstream tag & prepare metadata
+    runs-on: ubuntu-22.04
+    outputs:
+      should_build: ${{ steps.plan.outputs.should_build }}
+      version: ${{ steps.plan.outputs.version }}
+      release_tag: ${{ steps.plan.outputs.release_tag }}
+      upstream_tag: ${{ steps.sync.outputs.upstream_tag }}
+      rust_toolchain: ${{ steps.plan.outputs.rust_toolchain }}
+      target_sha: ${{ steps.sync.outputs.target_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.FORK_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check and merge latest upstream stable tag
+        id: sync
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SYNC_UPSTREAM: ${{ github.event_name == 'schedule' || inputs.sync_upstream == true }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          UPSTREAM_TAG="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq '.tag_name' 2>/dev/null || true)"
+          echo "upstream_tag=${UPSTREAM_TAG}" >> "$GITHUB_OUTPUT"
+          MERGED="false"
+
+          if [[ "${SYNC_UPSTREAM}" == "true" && -n "${UPSTREAM_TAG}" ]]; then
+            git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || \
+              git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+            git fetch upstream "refs/tags/${UPSTREAM_TAG}:refs/tags/${UPSTREAM_TAG}" --no-tags
+
+            if git merge-base --is-ancestor "refs/tags/${UPSTREAM_TAG}" HEAD; then
+              echo "Already up to date with upstream tag ${UPSTREAM_TAG}."
+            else
+              echo "Merging upstream tag ${UPSTREAM_TAG} into ${FORK_BRANCH}..."
+              if git merge --no-edit "refs/tags/${UPSTREAM_TAG}"; then
+                git push origin "HEAD:${FORK_BRANCH}"
+                MERGED="true"
+                echo "Successfully merged and pushed ${UPSTREAM_TAG}."
+              else
+                CONFLICTS="$(git diff --name-only --diff-filter=U || true)"
+                git merge --abort || true
+                TITLE="[Fork Sync] Merge conflict with upstream ${UPSTREAM_TAG}"
+                EXISTING="$(gh issue list --state open --search "${TITLE} in:title" --json number --jq '.[0].number // empty')"
+                if [[ -z "${EXISTING}" ]]; then
+                  gh issue create \
+                    --title "${TITLE}" \
+                    --body "$(printf 'Automated merge of upstream tag `%s` into `%s` hit conflicts.\n\nConflicting files:\n```\n%s\n```\n\nPlease resolve locally and push to `%s`.' "${UPSTREAM_TAG}" "${FORK_BRANCH}" "${CONFLICTS}" "${FORK_BRANCH}")"
+                fi
+                echo "::error::Merge conflict while syncing ${UPSTREAM_TAG}. Issue created/tracked."
+                exit 1
+              fi
+            fi
+          fi
+
+          echo "merged=${MERGED}" >> "$GITHUB_OUTPUT"
+          echo "target_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Compute build metadata
+        id: plan
+        env:
+          MERGED: ${{ steps.sync.outputs.merged }}
+          PUBLISH_INPUT: ${{ inputs.publish_release }}
+          SUFFIX_INPUT: ${{ inputs.release_suffix }}
+        run: |
+          set -euo pipefail
+          RUST_TOOLCHAIN="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml","rb"))["toolchain"]["channel"])')"
+          VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("pebrel_app/Cargo.toml","rb"))["package"]["version"])')"
+          SUFFIX="${SUFFIX_INPUT:-bw.${GITHUB_RUN_NUMBER}}"
+          RELEASE_TAG="v${VERSION}-${SUFFIX}"
+
+          SHOULD_BUILD="false"
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            if [[ "${PUBLISH_INPUT}" == "true" ]]; then
+              SHOULD_BUILD="true"
+            fi
+          elif [[ "${MERGED}" == "true" ]]; then
+            SHOULD_BUILD="true"
+          fi
+
+          echo "rust_toolchain=${RUST_TOOLCHAIN}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "should_build=${SHOULD_BUILD}" >> "$GITHUB_OUTPUT"
+          echo "Plan: should_build=${SHOULD_BUILD} version=${VERSION} tag=${RELEASE_TAG} toolchain=${RUST_TOOLCHAIN}"
+
+  linux-x64:
+    name: Build & package Linux x64
+    needs: sync-upstream
+    if: ${{ needs.sync-upstream.outputs.should_build == 'true' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      PACKAGE_VERSION: ${{ needs.sync-upstream.outputs.version }}
+      LINUXDEPLOY_VERSION: 1-alpha-20251107-1
+      LINUXDEPLOY_SHA256: c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync-upstream.outputs.target_sha }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install build and packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            appstream build-essential cmake curl desktop-file-utils dpkg-dev \
+            imagemagick libasound2-dev libdbus-1-dev libegl1-mesa-dev \
+            libfontconfig1-dev libfreetype6-dev libgl1-mesa-dev libudev-dev \
+            libvulkan1 libwayland-dev libx11-dev libx11-xcb-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxcb-xinput-dev libxcb-xkb-dev libxcb1-dev libxi-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev mesa-vulkan-drivers \
+            patchelf pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ needs.sync-upstream.outputs.rust_toolchain }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fork-linux-x64
+
+      - name: Run architecture and credential tests
+        run: |
+          python3 scripts/check_architecture.py
+          cargo test --locked -p pebrel-settings
+          cargo test --locked -p pebrel --bin pebrel platform::credentials
+          cargo test --locked -p pebrel --test file_line_budget
+
+      - name: Build GPUI release binary
+        run: cargo build --locked --release -p pebrel --bin pebrel -p pebrel_hook --bin pebrel-hook --features pebrel/gpui-shell
+
+      - name: Download pinned linuxdeploy
+        env:
+          LINUXDEPLOY: ${{ runner.temp }}/linuxdeploy-x86_64.AppImage
+        run: |
+          curl --fail --location --retry 3 --retry-all-errors --show-error \
+            --output "$LINUXDEPLOY" \
+            "https://github.com/linuxdeploy/linuxdeploy/releases/download/$LINUXDEPLOY_VERSION/linuxdeploy-x86_64.AppImage"
+          echo "$LINUXDEPLOY_SHA256  $LINUXDEPLOY" | sha256sum --check --strict
+          chmod 0755 "$LINUXDEPLOY"
+          echo "LINUXDEPLOY=$LINUXDEPLOY" >> "$GITHUB_ENV"
+
+      - name: Package Linux x64 assets
+        run: |
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$GITHUB_SHA")"
+          export SOURCE_DATE_EPOCH
+          bash scripts/package-linux.sh \
+            --channel stable \
+            --binary target/release/pebrel \
+            --version "$PACKAGE_VERSION" \
+            --output-directory dist \
+            --linuxdeploy "$LINUXDEPLOY" \
+            --force
+
+      - name: Upload Linux x64 assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: fork-linux-x64
+          path: |
+            dist/Pebrel-v${{ needs.sync-upstream.outputs.version }}-linux-x64.AppImage
+            dist/Pebrel-v${{ needs.sync-upstream.outputs.version }}-linux-x64.deb
+            dist/Pebrel-v${{ needs.sync-upstream.outputs.version }}-linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-x64:
+    name: Build & package Windows x64
+    needs: sync-upstream
+    if: ${{ needs.sync-upstream.outputs.should_build == 'true' }}
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      PACKAGE_VERSION: ${{ needs.sync-upstream.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync-upstream.outputs.target_sha }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ needs.sync-upstream.outputs.rust_toolchain }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fork-windows-x64
+
+      - name: Prepare pinned Windows console runtime
+        shell: pwsh
+        run: ./scripts/prepare-windows-runtime.ps1 -Destination assets/windows/conhost
+
+      - name: Run credential and settings tests
+        shell: pwsh
+        run: |
+          cargo test --locked -p pebrel-settings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p pebrel --bin pebrel platform::credentials
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build GPUI release binary
+        shell: pwsh
+        run: ./scripts/build-windows-product.ps1 -Configuration release -TargetDirectory target
+
+      - name: Package Windows x64 ZIP and installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/package-release.ps1 -Version $env:PACKAGE_VERSION -PackageBrand Pebrel -OutputDirectory dist -TargetDirectory target -Force
+          ./scripts/build-installer.ps1 -Version $env:PACKAGE_VERSION -PackageBrand Pebrel -OutputDirectory dist -TargetDirectory target -Force
+
+      - name: Upload Windows x64 assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: fork-windows-x64
+          path: |
+            dist/Pebrel-v${{ needs.sync-upstream.outputs.version }}-windows-x64.zip
+            dist/Pebrel-v${{ needs.sync-upstream.outputs.version }}-windows-x64-setup.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-release:
+    name: Publish Fork GitHub Release
+    needs: [sync-upstream, linux-x64, windows-x64]
+    if: ${{ needs.sync-upstream.outputs.should_build == 'true' }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS and publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.sync-upstream.outputs.release_tag }}
+          UPSTREAM_TAG: ${{ needs.sync-upstream.outputs.upstream_tag }}
+          TARGET_SHA: ${{ needs.sync-upstream.outputs.target_sha }}
+          VERSION: ${{ needs.sync-upstream.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          ls -lh
+
+          NOTES="$(printf 'Automated fork build from `%s` (`%s`), based on Pebrel `v%s` (latest upstream release: `%s`).\n\n### Fork Additions\n- Optional Bitwarden CLI (`bw` / `rbw`) credential store backend with self-hosted Bitwarden / Vaultwarden support.\n- See [FORK.md](https://github.com/%s/blob/%s/FORK.md) for configuration and usage.\n' "${FORK_BRANCH}" "${TARGET_SHA}" "${VERSION}" "${UPSTREAM_TAG:-unknown}" "${GITHUB_REPOSITORY}" "${FORK_BRANCH}")"
+
+          gh release create "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${TARGET_SHA}" \
+            --title "Pebrel ${RELEASE_TAG} (Bitwarden Fork)" \
+            --notes "${NOTES}" \
+            *

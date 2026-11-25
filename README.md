@@ -34,6 +34,9 @@
 
 ---
 
+> [!NOTE]
+> **Fork Notice (`wangtao94/pebrel`)**: This is a lightweight tracking fork of [`Kuddev/pebrel`](https://github.com/Kuddev/pebrel) that adds an **optional Bitwarden CLI (`bw` / `rbw`) credential store backend** (supporting self-hosted Bitwarden & Vaultwarden) and automated upstream sync + Windows/Linux x64 Release CI, while keeping the OS keychain as the default. See **[FORK.md](FORK.md)** for full differences, setup instructions, and environment variables.
+
 <p align="center">
   <img src="docs/screenshots/nebula-top-tabs.png" alt="Terminal tabs in Pebrel" width="1040" />
 </p>
